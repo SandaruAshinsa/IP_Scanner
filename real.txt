@@ -1,0 +1,392 @@
+import ipaddress
+import asyncio
+import socket
+import http.client
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+STOP_SCAN = False
+
+
+# ================= UTIL =================
+
+def get_ips(cidr):
+    return [str(ip) for ip in ipaddress.ip_network(cidr, strict=False)]
+
+
+def resolve_ip(host):
+    try:
+        return socket.gethostbyname(host)
+    except:
+        return None
+
+
+def ip_to_cidr(ip):
+    return ".".join(ip.split(".")[:3]) + ".0/24"
+
+
+# ================= SERVICE DETECTION =================
+
+def detect_service(server, banner):
+    text = (server + " " + banner).lower()
+
+    if "apache" in text:
+        return "Apache"
+    elif "nginx" in text:
+        return "Nginx"
+    elif "iis" in text:
+        return "IIS"
+    elif "lighttpd" in text:
+        return "Lighttpd"
+    else:
+        return "Unknown"
+
+
+# ================= HTTP =================
+
+def http_probe(ip, port, timeout):
+    try:
+        conn = http.client.HTTPConnection(ip, port, timeout=timeout)
+        conn.request("GET", "/")
+        res = conn.getresponse()
+
+        headers = dict(res.getheaders())
+        banner = f"{res.status} {res.reason}"
+        server = headers.get("Server", "")
+
+        conn.close()
+        return banner, server
+
+    except:
+        return "", ""
+
+
+# ================= SCAN =================
+
+async def scan_port(ip, port, timeout):
+    loop = asyncio.get_event_loop()
+
+    def run():
+        banner, server = "", ""
+
+        if port in (80, 443):
+            banner, server = http_probe(ip, port, timeout)
+
+        return (port, bool(banner), banner, server)
+
+    return await loop.run_in_executor(None, run)
+
+
+async def scan_ip(ip, ports, timeout, sem):
+    global STOP_SCAN
+
+    if STOP_SCAN:
+        return None
+
+    async with sem:
+        tasks = [scan_port(ip, p, timeout) for p in ports]
+        ports_data = await asyncio.gather(*tasks)
+
+        return {"ip": ip, "ports": ports_data}
+
+
+async def run_scan(cidr, ports, timeout, callback, concurrency):
+    global STOP_SCAN
+    STOP_SCAN = False
+
+    ips = get_ips(cidr)
+    sem = asyncio.Semaphore(concurrency)
+
+    tasks = [scan_ip(ip, ports, timeout, sem) for ip in ips]
+
+    total = len(tasks)
+    done = 0
+
+    for f in asyncio.as_completed(tasks):
+        if STOP_SCAN:
+            break
+
+        res = await f
+        done += 1
+
+        if res:
+            callback(res, done, total)
+
+
+# ================= GUI =================
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("⚡ Pro Scanner v3.1")
+        self.root.geometry("1200x700")
+        self.dark_mode = True
+
+        self.style = ttk.Style()
+        # CHANGE THEME TO 'clam' WHICH SUPPORTS CUSTOM COLORS BETTER ON WINDOWS
+        self.style.theme_use('clam') 
+        
+        self.build_ui()
+        self.apply_theme()
+
+    # ================= UI =================
+
+    def build_ui(self):
+        # Main container
+        main_container = tk.Frame(self.root)
+        main_container.pack(fill="both", expand=True)
+        
+        top = ttk.Frame(main_container, padding=10)
+        top.pack(fill="x")
+
+        ttk.Label(top, text="CIDR").grid(row=0, column=0, padx=5, pady=2)
+        self.cidr = ttk.Entry(top, width=18)
+        self.cidr.insert(0, "192.168.1.0/24")
+        self.cidr.grid(row=0, column=1, padx=5, pady=2)
+
+        ttk.Label(top, text="Host").grid(row=0, column=2, padx=5, pady=2)
+        self.host = ttk.Entry(top, width=15)
+        self.host.grid(row=0, column=3, padx=5, pady=2)
+        self.host.bind("<Return>", self.auto_cidr)
+
+        ttk.Label(top, text="Ports").grid(row=0, column=4, padx=5, pady=2)
+        self.ports = ttk.Entry(top, width=20)
+        self.ports.insert(0, "80,443")
+        self.ports.grid(row=0, column=5, padx=5, pady=2)
+
+        ttk.Label(top, text="Timeout").grid(row=0, column=6, padx=5, pady=2)
+        self.timeout = ttk.Entry(top, width=5)
+        self.timeout.insert(0, "1")
+        self.timeout.grid(row=0, column=7, padx=5, pady=2)
+
+        ttk.Label(top, text="Speed").grid(row=1, column=0, padx=5, pady=2)
+        self.speed = tk.Scale(top, from_=10, to=300, orient="horizontal", length=150)
+        self.speed.set(120)
+        self.speed.grid(row=1, column=1, padx=5, pady=2)
+
+        self.search = ttk.Entry(top, width=30)
+        self.search.grid(row=1, column=2, columnspan=2, padx=5, pady=2)
+        self.search.bind("<KeyRelease>", self.filter_results)
+
+        self.only_open = tk.BooleanVar()
+        ttk.Checkbutton(top, text="Only Open", variable=self.only_open).grid(row=1, column=4, padx=5, pady=2)
+
+        ttk.Button(top, text="▶ Start", command=self.start).grid(row=2, column=0, padx=5, pady=5)
+        ttk.Button(top, text="■ Stop", command=self.stop).grid(row=2, column=1, padx=5, pady=5)
+        ttk.Button(top, text="🧹 Clear", command=self.clear).grid(row=2, column=2, padx=5, pady=5)
+        ttk.Button(top, text="🌙 Theme", command=self.toggle_theme).grid(row=2, column=3, padx=5, pady=5)
+
+        self.progress = ttk.Progressbar(main_container, length=600, mode='determinate')
+        self.progress.pack(pady=10, padx=10)
+
+        # TABLE FRAME
+        table_frame = tk.Frame(main_container)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # TABLE
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=("IP","Port","Status","Service","Banner","Server"),
+            show="headings"
+        )
+
+        for c in ("IP","Port","Status","Service","Banner","Server"):
+            self.tree.heading(c, text=c)
+            self.tree.column(c, anchor="center", width=120)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        # Scrollbar
+        tree_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        tree_scroll.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+
+        # colors
+        self.tree.tag_configure("open", foreground="#4caf50")
+        self.tree.tag_configure("closed", foreground="#f44336")
+
+        # click to copy IP
+        self.tree.bind("<ButtonRelease-1>", self.copy_ip)
+
+    # ================= THEME (FIXED FOR WINDOWS) =================
+
+    def apply_theme(self):
+        if self.dark_mode:
+            # NekoBox Dark Colors
+            bg = "#2d2d2d"       # Main Background
+            panel = "#363636"    # Panel/Frame Background
+            header = "#404040"   # Headers
+            entry = "#4a4a4a"    # Inputs
+            border = "#555555"   # Borders
+            fg = "#e0e0e0"       # Text Color
+            select_bg = "#094771"# Selection Color
+            button_bg = "#505050"# Button background
+            button_active = "#1e88e5" # Button hover
+        else:
+            bg = "#f0f0f0"
+            panel = "#ffffff"
+            header = "#f0f0f0"
+            entry = "#ffffff"
+            border = "#d1d1d1"
+            fg = "#000000"
+            select_bg = "#cce8ff"
+            button_bg = "#e0e0e0"
+            button_active = "#1e88e5"
+
+        self.root.configure(bg=bg)
+
+        # Frame styles
+        self.style.configure("TFrame", background=panel)
+        
+        # Label styles
+        self.style.configure("TLabel", background=panel, foreground=fg, padding=2)
+        
+        # Checkbutton styles
+        self.style.configure("TCheckbutton", background=panel, foreground=fg)
+        self.style.map("TCheckbutton", 
+            background=[("active", panel), ("selected", panel)],
+            foreground=[("active", fg), ("selected", fg)])
+
+        # Button styles - Dark background
+        self.style.configure("TButton", 
+            background=button_bg, 
+            foreground=fg, 
+            relief="raised", 
+            borderwidth=1,
+            padding=5)
+        self.style.map("TButton", 
+            background=[("active", button_active), ("pressed", "#1565c0")],
+            foreground=[("active", "#ffffff"), ("pressed", "#ffffff")])
+
+        # Entry styles
+        self.style.configure("TEntry", 
+            fieldbackground=entry, 
+            foreground=fg, 
+            bordercolor=border,
+            padding=5)
+
+        # Scale (Slider)
+        self.style.configure("TScale", 
+            background=panel, 
+            troughcolor=entry, 
+            sliderrelief="flat",
+            sliderbackground=button_bg)
+
+        # Treeview styles - DARK BACKGROUND (CRITICAL FIX)
+        self.style.configure("Treeview",
+            background=entry,            # Dark background for data area
+            foreground=fg,
+            fieldbackground=entry,       # Dark background
+            rowheight=24,
+            borderwidth=1,
+            bordercolor=border
+        )
+        self.style.map("Treeview", 
+            background=[("selected", select_bg)],
+            foreground=[("selected", "#ffffff")]
+        )
+
+        self.style.configure("Treeview.Heading",
+            background=header,           # Dark header
+            foreground=fg,
+            relief="raised",
+            font=('Segoe UI', 9, 'bold'),
+            borderwidth=1
+        )
+
+        # Progressbar
+        self.style.configure("TProgressbar", 
+            troughcolor=entry, 
+            background="#4caf50", 
+            thickness=12,
+            borderwidth=1,
+            bordercolor=border)
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+
+    # ================= CONTROL =================
+
+    def start(self):
+        threading.Thread(target=self.run_async, daemon=True).start()
+
+    def run_async(self):
+        cidr = self.cidr.get()
+        ports = list(map(int, self.ports.get().split(",")))
+        timeout = float(self.timeout.get())
+        concurrency = int(self.speed.get())
+
+        asyncio.run(run_scan(cidr, ports, timeout, self.update_ui, concurrency))
+
+    def stop(self):
+        global STOP_SCAN
+        STOP_SCAN = True
+
+    def clear(self):
+        self.tree.delete(*self.tree.get_children())
+        self.progress["value"] = 0
+
+    # ================= FILTER =================
+
+    def filter_results(self, event=None):
+        keyword = self.search.get().lower()
+
+        for item in self.tree.get_children():
+            values = self.tree.item(item)["values"]
+            text = " ".join(map(str, values)).lower()
+
+            if keyword in text:
+                self.tree.reattach(item, "", "end")
+            else:
+                self.tree.detach(item)
+
+    # ================= COPY IP =================
+
+    def copy_ip(self, event):
+        item = self.tree.selection()
+        if item:
+            ip = self.tree.item(item[0])["values"][0]
+            self.root.clipboard_clear()
+            self.root.clipboard_append(ip)
+
+    # ================= AUTO CIDR =================
+
+    def auto_cidr(self, event=None):
+        ip = resolve_ip(self.host.get())
+        if ip:
+            self.cidr.delete(0, tk.END)
+            self.cidr.insert(0, ip_to_cidr(ip))
+
+    # ================= UPDATE =================
+
+    def update_ui(self, res, done, total):
+        self.progress["maximum"] = total
+        self.progress["value"] = done
+
+        for port, open_, banner, server in res["ports"]:
+
+            if self.only_open.get() and not open_:
+                continue
+
+            service = detect_service(server, banner)
+
+            status = "OPEN" if open_ else "CLOSED"
+            tag = "open" if open_ else "closed"
+
+            self.tree.insert(
+                "",
+                "end",
+                values=(res["ip"], port, status, service, banner, server),
+                tags=(tag,)
+            )
+
+        self.root.update()
+
+
+# ================= RUN =================
+
+root = tk.Tk()
+App(root)
+root.mainloop()

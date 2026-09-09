@@ -1,0 +1,23 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Build and distribution outputs
+build/
+dist/
+*.spec
+
+# Generated workspace folders and sample output files
+HOST_SNI/
+scanner_W.txt
+scanner_W.spec
+scan_results.json
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
