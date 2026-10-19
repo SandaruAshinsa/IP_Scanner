@@ -19,7 +19,6 @@ python scanner_W.py
 
 - `scanner_W.py` - main GUI scanner implementation
 - `scan_results.json` - sample scan output
-- `real.txt`, `test.txt`, `test2.txt` - sample input data
 
 ## Notes
 
